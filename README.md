@@ -7,6 +7,8 @@ out to VS1053B board which processes them into audible sound. It has no built-in
 
 More can be read on [Polish forum Forbot](https://forbot.pl/forum/topic/25873-cynthia-syntezator-midi-trs-a-oraz-usb/).
 
+**All code is AI generated and is mostly functional (there are some bugs, but for my use cases I don't need to fix them)**
+
 # Hardware
 * Raspberry Pi Pico (RP2040)
 * Adafruit VS1053 Codec
