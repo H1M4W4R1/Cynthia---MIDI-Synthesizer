@@ -87,31 +87,33 @@ class PlayerState:
 class MIDIPlayer:
     """
     Reads a mido MidiFile and streams MIDI bytes with correct timing.
-    Supports: play, pause/resume, rewind, seek, skip, volume (CC#7 scale).
+    Supports: play, pause/resume, rewind, seek (silent), skip, volume.
+
+    Design: a single background thread owns all playback.
+    Any operation that changes position (seek/rewind/load) stops the current
+    thread synchronously via _stop_thread(), then restarts from the new
+    position.  This avoids every race condition that arises from trying to
+    redirect a running thread mid-flight.
     """
 
     def __init__(self, midi_serial: MIDISerial):
-        self._ser       = midi_serial
-        self._state     = PlayerState.STOPPED
-        self._lock      = threading.Lock()
-        self._thread: threading.Thread | None = None
-        self._stop_flag = threading.Event()
-        self._pause_evt = threading.Event()
-        self._pause_evt.set()          # not paused initially
+        self._ser  = midi_serial
 
-        # current track
-        self._mid: mido.MidiFile | None = None
-        self._messages: list[tuple[float, bytes]] = []   # (abs_time_s, raw_bytes)
-        self._duration: float = 0.0
+        # Protected by _lock
+        self._state    = PlayerState.STOPPED
+        self._messages : list[tuple[float, bytes]] = []
+        self._duration : float = 0.0
+        self._pos      : float = 0.0          # start position for next play()
+        self._volume   : float = 1.0
+        self._lock     = threading.Lock()
 
-        # playback position (seconds into track)
-        self._pos: float = 0.0
-        self._seek_to: float | None = None
+        # Thread control
+        self._thread   : threading.Thread | None = None
+        self._stop_evt = threading.Event()    # set → thread must exit ASAP
+        self._pause_evt= threading.Event()
+        self._pause_evt.set()                 # clear = paused, set = running
 
-        # volume scale 0.0–1.0 applied to CC#7 messages
-        self._volume: float = 1.0
-
-        # callbacks (set by App)
+        # Callbacks (called from bg thread; must be set before play())
         self.on_position: callable | None = None   # (pos_s, dur_s) → None
         self.on_finished: callable | None = None   # () → None
 
@@ -130,17 +132,19 @@ class MIDIPlayer:
         return self._pos
 
     def load(self, path: str) -> float:
-        """Load a MIDI file. Returns duration in seconds. Thread-safe."""
-        mid = mido.MidiFile(path)
+        """Stop playback, load a new file, reset position. Returns duration."""
+        self._stop_thread()
+        mid      = mido.MidiFile(path)
         messages = self._flatten(mid)
         with self._lock:
-            self._mid      = mid
             self._messages = messages
             self._duration = messages[-1][0] if messages else 0.0
             self._pos      = 0.0
+            self._state    = PlayerState.STOPPED
         return self._duration
 
     def play(self) -> None:
+        """Start or resume playback."""
         with self._lock:
             if self._state == PlayerState.PLAYING:
                 return
@@ -148,192 +152,208 @@ class MIDIPlayer:
                 self._state = PlayerState.PLAYING
                 self._pause_evt.set()
                 return
-            # STOPPED → start new thread
-            self._state     = PlayerState.PLAYING
-            self._stop_flag.clear()
-            self._pause_evt.set()
-            self._thread = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
+            # STOPPED → launch thread from current _pos
+            self._state = PlayerState.PLAYING
+        self._launch_thread()
 
     def pause(self) -> None:
         with self._lock:
-            if self._state == PlayerState.PLAYING:
-                self._state = PlayerState.PAUSED
-                self._pause_evt.clear()
-                self._ser.all_sound_off()
+            if self._state != PlayerState.PLAYING:
+                return
+            self._state = PlayerState.PAUSED
+        self._pause_evt.clear()
+        self._ser.all_sound_off()
 
     def stop(self) -> None:
-        self._stop_flag.set()
-        self._pause_evt.set()   # unblock if paused
+        """Stop and reset position to 0."""
+        self._stop_thread()
         with self._lock:
-            self._state = PlayerState.STOPPED
             self._pos   = 0.0
+            self._state = PlayerState.STOPPED
         self._ser.all_sound_off()
+
+    def seek(self, seconds: float) -> None:
+        """
+        Jump to position silently:
+        1. Stop current thread.
+        2. Update _pos.
+        3. Restart thread if we were playing, otherwise stay stopped.
+        """
+        with self._lock:
+            was_playing = (self._state == PlayerState.PLAYING)
+            was_paused  = (self._state == PlayerState.PAUSED)
+        self._stop_thread()
+        with self._lock:
+            self._pos = max(0.0, min(seconds, self._duration))
+        self._ser.all_sound_off()
+        if was_playing or was_paused:
+            with self._lock:
+                self._state = PlayerState.PLAYING
+            self._launch_thread()
 
     def rewind(self) -> None:
         self.seek(0.0)
 
-    def seek(self, seconds: float) -> None:
-        with self._lock:
-            self._seek_to = max(0.0, min(seconds, self._duration))
-
     def set_volume(self, v: float) -> None:
-        """v in 0.0–1.0."""
-        self._volume = max(0.0, min(1.0, v))
+        with self._lock:
+            self._volume = max(0.0, min(1.0, v))
 
     def skip(self) -> None:
-        """Signal playback thread to finish current track."""
-        self._stop_flag.set()
-        self._pause_evt.set()
+        """Stop current track; caller decides what to play next."""
+        self._stop_thread()
+        with self._lock:
+            self._pos   = 0.0
+            self._state = PlayerState.STOPPED
+        self._ser.all_sound_off()
 
-    # ── internals ─────────────────────────────────────────────────────────────
+    # ── thread management ─────────────────────────────────────────────────────
+
+    def _stop_thread(self) -> None:
+        """Signal the bg thread to stop and block until it exits."""
+        self._stop_evt.set()
+        self._pause_evt.set()   # unblock if sleeping in pause
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread   = None
+        self._stop_evt.clear()
+
+    def _launch_thread(self) -> None:
+        self._stop_evt.clear()
+        self._pause_evt.set()   # ensure not paused on start
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    # ── playback loop ─────────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        with self._lock:
+            messages = self._messages[:]
+            start_pos = self._pos
+            duration  = self._duration
+
+        # Find the first message at or after start_pos (silent seek already done)
+        idx = self._bisect(messages, start_pos)
+        t0  = time.perf_counter() - start_pos   # wall-clock anchor
+
+        i = idx
+        while i < len(messages):
+            if self._stop_evt.is_set():
+                break
+
+            msg_time, raw = messages[i]
+
+            # ── wait loop: sleep in small increments, honouring pause/stop ──
+            while True:
+                if self._stop_evt.is_set():
+                    break
+
+                # Pause: block here without burning CPU
+                if not self._pause_evt.is_set():
+                    # Record position before blocking
+                    with self._lock:
+                        self._pos = msg_time
+                    self._pause_evt.wait()
+                    if self._stop_evt.is_set():
+                        break
+                    # Re-anchor wall clock after unpause
+                    t0 = time.perf_counter() - msg_time
+
+                elapsed = time.perf_counter() - t0
+                delta   = msg_time - elapsed
+                if delta <= 0:
+                    break
+                time.sleep(min(delta, 0.002))   # 2 ms granularity
+
+            if self._stop_evt.is_set():
+                with self._lock:
+                    self._pos = msg_time
+                break
+
+            # ── send ──────────────────────────────────────────────────────
+            self._ser.send(self._apply_volume(raw))
+
+            # ── update reported position ───────────────────────────────────
+            with self._lock:
+                self._pos = msg_time
+            if self.on_position:
+                self.on_position(msg_time, duration)
+
+            i += 1
+
+        # ── thread exiting ────────────────────────────────────────────────
+        if not self._stop_evt.is_set():
+            # Reached end of track naturally
+            with self._lock:
+                self._state = PlayerState.STOPPED
+                self._pos   = 0.0
+            self._ser.all_sound_off()
+            if self.on_finished:
+                self.on_finished()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _bisect(messages: list, pos: float) -> int:
+        """Return index of first message with time >= pos."""
+        lo, hi = 0, len(messages)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if messages[mid][0] < pos:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
 
     @staticmethod
     def _flatten(mid: mido.MidiFile) -> list[tuple[float, bytes]]:
         """
-        Merge all tracks and produce (absolute_time_seconds, raw_bytes) pairs.
+        Merge all tracks → sorted (absolute_seconds, raw_bytes) list.
 
-        Strategy:
-          1. Convert every track's delta-tick messages to absolute-tick messages.
-          2. Merge all tracks into one list sorted by absolute tick.
-          3. Walk the merged list in tick order, maintaining a running tempo
-             (default 500 000 µs/beat = 120 BPM) and accumulate real time.
+        Steps:
+          1. Accumulate each track's delta-ticks into absolute ticks.
+          2. Merge & sort by absolute tick.
+          3. Walk in tick order, tracking tempo changes to convert ticks→seconds.
         """
-        ticks_per_beat = mid.ticks_per_beat  # e.g. 480
+        ticks_per_beat = mid.ticks_per_beat
 
-        # ── Step 1 & 2: build merged list of (abs_tick, msg) ─────────────────
-        merged: list[tuple[int, mido.Message]] = []
+        # Step 1 & 2: absolute-tick merge
+        merged: list[tuple[int, object]] = []
         for track in mid.tracks:
             abs_tick = 0
             for msg in track:
-                abs_tick += msg.time          # msg.time is delta ticks here
+                abs_tick += msg.time        # delta ticks
                 merged.append((abs_tick, msg))
-
-        # Sort by absolute tick; stable sort preserves track order for ties
         merged.sort(key=lambda x: x[0])
 
-        # ── Step 3: convert ticks → seconds using tempo map ──────────────────
-        tempo        = 500_000   # µs per beat (120 BPM default)
-        last_tick    = 0
-        elapsed_us   = 0.0      # accumulated microseconds
-        result       = []
+        # Step 3: ticks → seconds with live tempo map
+        tempo      = 500_000    # µs/beat  (120 BPM default)
+        last_tick  = 0
+        elapsed_us = 0.0
+        result     = []
 
         for abs_tick, msg in merged:
-            # Advance elapsed time by the tick gap since last event
-            tick_delta  = abs_tick - last_tick
-            elapsed_us += tick_delta * (tempo / ticks_per_beat)
+            delta_tick  = abs_tick - last_tick
+            elapsed_us += delta_tick * (tempo / ticks_per_beat)
             last_tick   = abs_tick
 
             if msg.is_meta:
-                # Capture tempo changes but don't send them as MIDI bytes
                 if msg.type == "set_tempo":
                     tempo = msg.tempo
                 continue
 
-            if not hasattr(msg, 'bytes'):
-                continue
-
-            raw = msg.bytes()
-            if not raw:
-                continue
-
-            result.append((elapsed_us / 1_000_000.0, bytes(raw)))
+            raw = bytes(msg.bytes())
+            if raw:
+                result.append((elapsed_us / 1_000_000.0, raw))
 
         return result
 
-    def _run(self):
-        with self._lock:
-            messages = self._messages[:]
-            pos      = self._pos
-
-        idx = self._find_index(messages, pos)
-        t0  = time.perf_counter() - pos   # wall-clock anchor
-
-        for i in range(idx, len(messages)):
-            # ── stop check ─────────────────────────────────────────────────
-            if self._stop_flag.is_set():
-                break
-
-            # ── seek check ─────────────────────────────────────────────────
-            with self._lock:
-                seek = self._seek_to
-                self._seek_to = None
-            if seek is not None:
-                pos = seek
-                idx = self._find_index(messages, pos)
-                i   = idx
-                t0  = time.perf_counter() - pos
-                self._ser.all_sound_off()
-                if i >= len(messages):
-                    break
-
-            msg_time, raw = messages[i]
-
-            # ── wait until scheduled time ──────────────────────────────────
-            while True:
-                if self._stop_flag.is_set():
-                    break
-                self._pause_evt.wait()          # block when paused
-                if self._stop_flag.is_set():
-                    break
-
-                # re-check seek
-                with self._lock:
-                    seek = self._seek_to
-                    self._seek_to = None
-                if seek is not None:
-                    pos = seek
-                    idx = self._find_index(messages, pos)
-                    i   = idx
-                    t0  = time.perf_counter() - pos
-                    self._ser.all_sound_off()
-                    break
-
-                now     = time.perf_counter()
-                elapsed = now - t0
-                delta   = msg_time - elapsed
-
-                if delta <= 0:
-                    break
-                time.sleep(min(delta, 0.005))
-
-            if self._stop_flag.is_set():
-                with self._lock:
-                    self._pos = time.perf_counter() - t0
-                break
-
-            # ── apply volume to CC#7 ───────────────────────────────────────
-            data = self._apply_volume(raw)
-
-            # ── send ───────────────────────────────────────────────────────
-            self._ser.send(data)
-
-            # ── update position ────────────────────────────────────────────
-            with self._lock:
-                self._pos = msg_time
-            if self.on_position:
-                self.on_position(msg_time, self._duration)
-
-        # track finished naturally
-        with self._lock:
-            was_playing = (self._state == PlayerState.PLAYING)
-            self._state = PlayerState.STOPPED
-            self._pos   = 0.0
-        self._ser.all_sound_off()
-        if was_playing and self.on_finished:
-            self.on_finished()
-
-    def _find_index(self, messages: list, pos: float) -> int:
-        for i, (t, _) in enumerate(messages):
-            if t >= pos:
-                return i
-        return len(messages)
-
     def _apply_volume(self, raw: bytes) -> bytes:
-        """Scale CC#7 value by current volume."""
+        """Scale CC#7 (main volume) by the current volume factor."""
         if len(raw) >= 3 and (raw[0] & 0xF0) == 0xB0 and raw[1] == 7:
-            scaled = int(raw[2] * self._volume)
-            return bytes([raw[0], raw[1], max(0, min(127, scaled))])
+            with self._lock:
+                vol = self._volume
+            scaled = max(0, min(127, int(raw[2] * vol)))
+            return bytes([raw[0], raw[1], scaled])
         return raw
 
 
@@ -886,8 +906,7 @@ class App(tk.Tk):
         if idx < 0 or idx >= len(paths):
             return
         path = paths[idx]
-        self._player.stop()
-        time.sleep(0.05)   # let stop settle
+        # load() stops any running thread synchronously before loading
         try:
             dur = self._player.load(path)
         except Exception as e:
@@ -899,6 +918,8 @@ class App(tk.Tk):
         name = os.path.basename(path)
         self._track_lbl.config(text=name)
         self._time_slider.config(to=max(dur, 1.0))
+        self._pos_var.set(0.0)
+        self._time_lbl.config(text=f"00:00 / {fmt_time(dur)}")
         self._player.set_volume(self._vol_var.get() / 127)
         self._player.play()
         if self._play_btn_ref:
@@ -908,6 +929,7 @@ class App(tk.Tk):
     def _rewind(self):
         self._player.rewind()
         self._pos_var.set(0.0)
+        self._time_lbl.config(text=f"00:00 / {fmt_time(self._duration)}")
 
     def _skip_next(self):
         paths = self._queue_widget.items
@@ -917,9 +939,11 @@ class App(tk.Tk):
         if nxt < len(paths):
             self._play_track(nxt)
         else:
-            self._player.stop()
+            # End of queue: stop cleanly without triggering on_finished again
+            self._player.skip()
             self._current_idx = -1
             self._queue_widget.clear_playing()
+            self._pos_var.set(0.0)
             if self._play_btn_ref:
                 self._play_btn_ref.config(text="▶")
             self._status.info("End of queue")
@@ -930,7 +954,11 @@ class App(tk.Tk):
         self._scrubbing = True
 
     def _scrub_end(self, _=None):
-        self._player.seek(self._pos_var.get())
+        if self._duration > 0:
+            self._player.seek(self._pos_var.get())
+            # Update play button if seek restarted playback
+            if self._player.state == PlayerState.PLAYING and self._play_btn_ref:
+                self._play_btn_ref.config(text="⏸")
         self._scrubbing = False
 
     def _on_time_slide(self, val=None):
